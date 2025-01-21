@@ -1,0 +1,6 @@
+<Button
+    android:id="@+id/sortButton"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:text="並び替え"
+    android:layout_marginTop="16dp"/> 
