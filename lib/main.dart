@@ -5,21 +5,33 @@ import 'package:file_picker/file_picker.dart';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:async';
 import 'dart:convert';
+import 'package:audio_session/audio_session.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  
-  // ストレージ権限をリクエスト
   await requestStoragePermissions();
+  
+  // AudioSessionの設定
+  final session = await AudioSession.instance;
+  if (Platform.isIOS) {
+    await session.configure(const AudioSessionConfiguration(
+      androidAudioAttributes: AndroidAudioAttributes(
+        contentType: AndroidAudioContentType.music,
+        usage: AndroidAudioUsage.media,
+      ),
+      androidWillPauseWhenDucked: true,
+    ));
+  }
   
   runApp(const MyApp());
 }
 
 Future<void> requestStoragePermissions() async {
-  var status = await Permission.storage.status;
-  if (!status.isGranted) {
-    await [Permission.storage, Permission.manageExternalStorage].request();
+  if (Platform.isAndroid) {
+    await Permission.storage.request();
+    await Permission.manageExternalStorage.request();
   }
 }
 
@@ -29,13 +41,28 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Music Player',
+      title: '安定版ミュージックプレイヤー',
       theme: ThemeData(
         primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
       home: const MyHomePage(),
     );
   }
+}
+
+class MusicFile {
+  final String path;
+  final String name;
+  final Duration duration;
+  bool isSelected;
+
+  MusicFile({
+    required this.path,
+    required this.name,
+    required this.duration,
+    this.isSelected = true,
+  });
 }
 
 class MyHomePage extends StatefulWidget {
@@ -45,216 +72,213 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-// クラスをトップレベルに移動
-class MusicFile {
-  final String path;
-  final String name;
-  final Duration duration;
-  final String artist;  // artistを戻す（ソート機能のため）
-  bool isSelected;
-
-  MusicFile({
-    required this.path,
-    required this.name,
-    required this.duration,
-    this.artist = '',  // デフォルト値を設定
-    this.isSelected = true,
-  });
-}
-
 class _MyHomePageState extends State<MyHomePage> {
   final AudioPlayer _audioPlayer = AudioPlayer();
+  final List<StreamSubscription> _subscriptions = [];
   bool _isPlaying = false;
+  bool _isLoading = false;
   String? _currentFilePath;
   List<MusicFile> _playlist = [];
   int _currentIndex = 0;
   late SharedPreferences _prefs;
-  
-  // クラス内でstaticを削除
-  final String defaultMusicPath = '/storage/emulated/0/Music/jumpstart';
+  final _playerStateLock = Lock(); // 排他制御用ロック
 
   @override
   void initState() {
     super.initState();
-    _setupAudioPlayer();
-    _loadPreferences();
-    _loadDefaultFolder();  // 起動時にデフォルトフォルダを読み込む
+    _initPlayer();
+    _loadPreferences().then((_) => _loadLastSession());
+    _setupBackgroundPlayback();
   }
 
-  void _setupAudioPlayer() {
-    _audioPlayer.onPlayerComplete.listen((_) {
-      print('Song completed, playing next');
-      _playNext();
-    });
-
-    _audioPlayer.onPlayerStateChanged.listen((PlayerState state) {
-      print('Player state changed: $state');
-      setState(() {
-        _isPlaying = state == PlayerState.playing;
-      });
-    });
+  void _initPlayer() {
+    _subscriptions.addAll([
+      _audioPlayer.onPlayerStateChanged.listen(_handlePlayerStateChange),
+      _audioPlayer.onPositionChanged.listen(_handlePositionChange),
+      _audioPlayer.onDurationChanged.listen(_handleDurationChange),
+      _audioPlayer.onPlayerComplete.listen(_handlePlaybackComplete),
+    ]);
   }
 
-  // 設定の読み込み
+  @override
+  void dispose() {
+    _audioPlayer.dispose();
+    for (var sub in _subscriptions) {
+      sub.cancel();
+    }
+    super.dispose();
+  }
+
   Future<void> _loadPreferences() async {
     _prefs = await SharedPreferences.getInstance();
   }
 
-  // チェックボックスの状態を保存
-  Future<void> _saveSelectionState() async {
-    final selections = _playlist.asMap().map((index, music) => 
-      MapEntry(music.path, music.isSelected));
-    await _prefs.setString('selections', jsonEncode(selections));
-  }
-
-  // チェックボックスの状態を読み込み
-  Future<void> _loadSelectionState() async {
-    final selectionsJson = _prefs.getString('selections');
-    if (selectionsJson != null) {
-      final selections = jsonDecode(selectionsJson) as Map<String, dynamic>;
-      for (var music in _playlist) {
-        music.isSelected = selections[music.path] ?? true;
-      }
-      setState(() {});
+  Future<void> _loadLastSession() async {
+    final lastFolder = _prefs.getString('lastFolder');
+    if (lastFolder != null && await Directory(lastFolder).exists()) {
+      await _loadMusicFromFolder(lastFolder);
+      await _loadSelectionState();
     }
   }
 
-  // ソートメニューを表示
-  void _showSortMenu() {
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('並び替え'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                title: const Text('名前順'),
-                onTap: () {
-                  _sortPlaylist('name');
-                  Navigator.pop(context);
-                },
-              ),
-              ListTile(
-                title: const Text('アーティスト順'),
-                onTap: () {
-                  _sortPlaylist('artist');
-                  Navigator.pop(context);
-                },
-              ),
-              ListTile(
-                title: const Text('時間順'),
-                onTap: () {
-                  _sortPlaylist('duration');
-                  Navigator.pop(context);
-                },
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  // プレイリストをソート
-  void _sortPlaylist(String criteria) {
-    setState(() {
-      switch (criteria) {
-        case 'name':
-          _playlist.sort((a, b) => a.name.compareTo(b.name));
-          break;
-        case 'artist':
-          _playlist.sort((a, b) => 
-            (a.artist ?? '').compareTo(b.artist ?? ''));
-          break;
-        case 'duration':
-          _playlist.sort((a, b) => 
-            (a.duration ?? Duration.zero).compareTo(b.duration ?? Duration.zero));
-          break;
+  // プレイヤー状態管理（排他制御付き）
+  Future<void> _handlePlayerStateChange(PlayerState state) async {
+    if (!mounted) return;
+    
+    await _playerStateLock.synchronized(() async {
+      if (state == PlayerState.stopped && !_isLoading) {
+        await _playNextSong();
       }
-      // 現在再生中の曲の新しいインデックスを取得
-      if (_currentFilePath != null) {
-        _currentIndex = _playlist.indexWhere((file) => file.path == _currentFilePath);
-      }
+      setState(() => _isPlaying = state == PlayerState.playing);
     });
   }
 
-  // フォルダ選択メソッドを追加
-  Future<void> _pickMusicFolder() async {
-    try {
-      String? selectedDirectory = await FilePicker.platform.getDirectoryPath();
-      if (selectedDirectory == null) return;
-
-      await _prefs.setString('lastFolder', selectedDirectory);
-      await _loadMusicFromFolder(selectedDirectory);
-      await _loadSelectionState();  // 追加：選択状態を復元
-      setState(() {});
-    } catch (e) {
-      print('フォルダの選択でエラーが発生しました: $e');
-    }
+  void _handlePositionChange(Duration position) {
+    // 再生位置表示用（必要に応じて実装）
   }
 
-  Future<void> _loadDefaultFolder() async {
-    final lastFolder = _prefs.getString('lastFolder');
-    if (lastFolder != null) {
-      await _loadMusicFromFolder(lastFolder);
-      await _loadSelectionState();  // 追加：選択状態を復元
-      setState(() {});
-    }
+  void _handleDurationChange(Duration duration) {
+    // 曲の長さ更新用
   }
 
-  // 音楽ファイルを処理する補助メソッド
-  Future<MusicFile?> _processMusicFile(File file) async {
+  void _handlePlaybackComplete(void _) {
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _playNextSong());
+  }
+
+  Future<void> _playMusic() async {
+    if (_playlist.isEmpty || _isLoading) return;
+    
+    _isLoading = true;
     try {
-      final player = AudioPlayer();
-      Duration? songDuration;
-      try {
-        await player.setSource(DeviceFileSource(file.path));
-        songDuration = await player.getDuration();
-        
-        String name = file.path.split(Platform.pathSeparator).last;
-        return MusicFile(
-          path: file.path,
-          name: name,
-          duration: songDuration ?? Duration.zero,
-        );
-      } finally {
-        await player.dispose();
+      final currentSong = _playlist[_currentIndex];
+      if (!currentSong.isSelected) {
+        await _playNextSong();
+        return;
       }
+
+      await _audioPlayer.stop();
+      await _audioPlayer.setSource(DeviceFileSource(currentSong.path));
+      await _audioPlayer.resume();
+
+      setState(() {
+        _currentFilePath = currentSong.path;
+      });
+      await _prefs.setInt('lastIndex', _currentIndex);
     } catch (e) {
-      print('Error processing file ${file.path}: $e');
+      print('再生エラー: $e');
+      await _playNextSong();
+    } finally {
+      _isLoading = false;
+    }
+  }
+
+  Future<void> _playNextSong() async {
+    if (_playlist.isEmpty) return;
+
+    int originalIndex = _currentIndex;
+    int nextIndex = _currentIndex;
+    int checkedCount = 0;
+
+    while (checkedCount < _playlist.length) {
+      nextIndex = (nextIndex + 1) % _playlist.length;
+      checkedCount++;
+
+      if (_playlist[nextIndex].isSelected) {
+        _currentIndex = nextIndex;
+        await _playMusic();
+        return;
+      }
+    }
+
+    if (originalIndex == _currentIndex) {
+      await _audioPlayer.stop();
+      setState(() => _isPlaying = false);
+    }
+  }
+
+  Future<void> _playPreviousSong() async {
+    if (_playlist.isEmpty) return;
+
+    int originalIndex = _currentIndex;
+    int prevIndex = _currentIndex;
+    int checkedCount = 0;
+
+    while (checkedCount < _playlist.length) {
+      prevIndex = (prevIndex - 1 + _playlist.length) % _playlist.length;
+      checkedCount++;
+
+      if (_playlist[prevIndex].isSelected) {
+        _currentIndex = prevIndex;
+        await _playMusic();
+        return;
+      }
+    }
+
+    if (originalIndex == _currentIndex) {
+      await _audioPlayer.stop();
+      setState(() => _isPlaying = false);
+    }
+  }
+
+  Future<void> _loadMusicFromFolder(String path) async {
+    try {
+      final dir = Directory(path);
+      if (!await dir.exists()) return;
+
+      _playlist = await dir.list()
+        .asyncMap((file) => _processFile(file))
+        .where((music) => music != null)
+        .cast<MusicFile>()
+        .toList();
+
+      if (_playlist.isNotEmpty) {
+        _currentIndex = _prefs.getInt('lastIndex') ?? 0;
+        _currentIndex = _currentIndex.clamp(0, _playlist.length - 1);
+        _currentFilePath = _playlist[_currentIndex].path;
+      }
+
+      setState(() {});
+      await _prefs.setString('lastFolder', path);
+    } catch (e) {
+      print('フォルダ読み込みエラー: $e');
+    }
+  }
+
+  Future<MusicFile?> _processFile(FileSystemEntity file) async {
+    if (file is! File) return null;
+    if (!['.mp3', '.m4a', '.wav'].any(file.path.toLowerCase().endsWith)) return null;
+
+    final player = AudioPlayer();
+    try {
+      await player.setSource(DeviceFileSource(file.path));
+      final duration = await player.getDuration() ?? Duration.zero;
+      return MusicFile(
+        path: file.path,
+        name: _getFileName(file.path),
+        duration: duration,
+      );
+    } catch (e) {
+      print('ファイル処理エラー: ${file.path} - $e');
       return null;
+    } finally {
+      await player.dispose();
     }
   }
 
-  // 有効な音楽ファイルをプレイリストに追加
-  void _addValidMusicFiles(List<MusicFile?> results) {
-    for (var result in results) {
-      if (result != null) {
-        _playlist.add(result);
-      }
-    }
+  String _getFileName(String path) {
+    return path.split(Platform.pathSeparator).last;
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Music Player'),
+        title: const Text('安定版プレイヤー'),
         actions: [
-          // 全選択/全解除ボタンを追加
           IconButton(
-            icon: const Icon(Icons.select_all),
-            onPressed: () {
-              final allSelected = _playlist.every((music) => music.isSelected);
-              setState(() {
-                for (var music in _playlist) {
-                  music.isSelected = !allSelected;
-                }
-                _saveSelectionState();  // 状態を保存
-              });
-            },
+            icon: const Icon(Icons.folder_open),
+            onPressed: _pickMusicFolder,
           ),
           IconButton(
             icon: const Icon(Icons.sort),
@@ -264,264 +288,64 @@ class _MyHomePageState extends State<MyHomePage> {
       ),
       body: Column(
         children: [
-          // ファイル選択ボタン
-          Padding(
-            padding: const EdgeInsets.all(8.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                ElevatedButton(
-                  onPressed: _pickAndPlayMusic,
-                  child: const Text('ファイルを選択'),
-                ),
-                ElevatedButton(
-                  onPressed: _pickMusicFolder,
-                  child: const Text('フォルダを選択'),
-                ),
-              ],
-            ),
-          ),
-          
-          // 再生コントロール
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 16.0),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                IconButton(
-                  iconSize: 48,
-                  icon: const Icon(Icons.skip_previous),
-                  onPressed: () {
-                    if (_playlist.isNotEmpty) {
-                      setState(() {
-                        _currentIndex = (_currentIndex - 1) % _playlist.length;
-                        if (_currentIndex < 0) _currentIndex = _playlist.length - 1;
-                        _currentFilePath = _playlist[_currentIndex].path;
-                      });
-                      _playMusic();
-                    }
-                  },
-                ),
-                IconButton(
-                  iconSize: 64,
-                  icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
-                  onPressed: () {
-                    if (_isPlaying) {
-                      _audioPlayer.pause();
-                      setState(() => _isPlaying = false);
-                    } else {
-                      if (_currentFilePath != null) {
-                        _playMusic();
-                      }
-                    }
-                  },
-                ),
-                IconButton(
-                  iconSize: 48,
-                  icon: const Icon(Icons.skip_next),
-                  onPressed: () {
-                    if (_playlist.isNotEmpty) {
-                      setState(() {
-                        _currentIndex = (_currentIndex + 1) % _playlist.length;
-                        _currentFilePath = _playlist[_currentIndex].path;
-                      });
-                      _playMusic();
-                    }
-                  },
-                ),
-              ],
-            ),
-          ),
+          _buildPlayerControls(),
+          Expanded(child: _buildPlaylist()),
+        ],
+      ),
+    );
+  }
 
-          // 現在再生中の曲情報
-          if (_currentFilePath != null && _playlist.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Text(
-                _playlist[_currentIndex].name,
-                style: const TextStyle(fontSize: 16),
-                textAlign: TextAlign.center,
+  Widget _buildPlayerControls() {
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        children: [
+          Text(
+            _currentFilePath != null 
+              ? _getFileName(_currentFilePath!)
+              : '曲を選択してください',
+            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.skip_previous),
+                iconSize: 40,
+                onPressed: _playPreviousSong,
               ),
-            ),
-
-          // プレイリスト表示を更新
-          Expanded(
-            child: _buildPlaylist(),
+              IconButton(
+                icon: Icon(_isPlaying ? Icons.pause_circle_filled : Icons.play_circle_filled),
+                iconSize: 64,
+                onPressed: _togglePlayback,
+              ),
+              IconButton(
+                icon: const Icon(Icons.skip_next),
+                iconSize: 40,
+                onPressed: _playNextSong,
+              ),
+            ],
           ),
         ],
       ),
     );
   }
 
-  // ファイル選択と再生
-  Future<void> _pickAndPlayMusic() async {
-    try {
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.audio,
-        allowMultiple: true,
-      );
-
-      if (result != null) {
-        _playlist.clear();
-        for (var file in result.files) {
-          if (file.path != null) {
-            final player = AudioPlayer();
-            Duration? songDuration;
-            try {
-              await player.setSource(DeviceFileSource(file.path!));
-              songDuration = await player.getDuration();
-            } finally {
-              await player.dispose();
-            }
-
-            _playlist.add(MusicFile(
-              path: file.path!,
-              name: file.name,
-              duration: songDuration ?? Duration.zero,
-            ));
-          }
-        }
-
-        await _loadSelectionState();  // 保存された選択状態を読み込み
-
-        setState(() {
-          if (_playlist.isNotEmpty) {
-            _currentIndex = 0;
-            _currentFilePath = _playlist[0].path;
-          }
-        });
-
-        await _playMusic();
+  Future<void> _togglePlayback() async {
+    if (_isPlaying) {
+      await _audioPlayer.pause();
+    } else {
+      if (_currentFilePath == null && _playlist.isNotEmpty) {
+        _currentIndex = 0;
+        _currentFilePath = _playlist[0].path;
       }
-    } catch (e) {
-      print('Error picking music: $e');
-    }
-  }
-
-  Future<void> _playMusic() async {
-    if (_playlist.isEmpty) return;
-
-    // 現在の曲が選択されていない場合、次の選択された曲を探す
-    if (!_playlist[_currentIndex].isSelected) {
-      print('Current song is not selected, finding next selected song');
-      await _playNextSong();
-      return;
-    }
-
-    try {
-      final currentSong = _playlist[_currentIndex];
-      print('Attempting to play: ${currentSong.name}');
-
-      await _audioPlayer.play(DeviceFileSource(currentSong.path));
-      setState(() {
-        _isPlaying = true;
-        _currentFilePath = currentSong.path;
-      });
-    } catch (e) {
-      print('Error playing music: $e');
-      await _playNextSong();
-    }
-  }
-
-  Future<void> _pauseMusic() async {
-    await _audioPlayer.pause();
-    setState(() {
-      _isPlaying = false;
-    });
-  }
-
-  Future<void> _playNext() async {
-    if (_playlist.isEmpty) return;
-    
-    setState(() {
-      _currentIndex = (_currentIndex + 1) % _playlist.length;
-      _currentFilePath = _playlist[_currentIndex].path;
-    });
-    
-    await _playMusic();
-  }
-
-  Future<void> _playPrevious() async {
-    if (_currentIndex > 0) {
-      setState(() {
-        _currentIndex--;
-        _currentFilePath = _playlist[_currentIndex].path;
-      });
       await _playMusic();
     }
   }
 
-  Future<void> _playNextSong() async {
-    if (_playlist.isEmpty) return;
-
-    int nextIndex = _currentIndex;
-    int checkedCount = 0;
-    
-    // 選択された曲が見つかるまで、または全曲チェック済みになるまでループ
-    do {
-      nextIndex = (nextIndex + 1) % _playlist.length;
-      checkedCount++;
-      
-      // 選択された曲が見つかった場合
-      if (_playlist[nextIndex].isSelected) {
-        setState(() {
-          _currentIndex = nextIndex;
-          _currentFilePath = _playlist[nextIndex].path;
-        });
-        await _playMusic();
-        return;
-      }
-      
-      // 全曲チェックしても選択された曲が見つからない場合
-      if (checkedCount >= _playlist.length) {
-        print('No selected songs in playlist');
-        setState(() {
-          _isPlaying = false;
-        });
-        return;
-      }
-    } while (true);
-  }
-
-  Future<void> _playPreviousSong() async {
-    if (_playlist.isEmpty) return;
-
-    int prevIndex = _currentIndex;
-    int checkedCount = 0;
-    
-    // 選択された曲が見つかるまで、または全曲チェック済みになるまでループ
-    do {
-      prevIndex = (prevIndex - 1 + _playlist.length) % _playlist.length;
-      checkedCount++;
-      
-      // 選択された曲が見つかった場合
-      if (_playlist[prevIndex].isSelected) {
-        setState(() {
-          _currentIndex = prevIndex;
-          _currentFilePath = _playlist[prevIndex].path;
-        });
-        await _playMusic();
-        return;
-      }
-      
-      // 全曲チェックしても選択された曲が見つからない場合
-      if (checkedCount >= _playlist.length) {
-        print('No selected songs in playlist');
-        return;
-      }
-    } while (true);
-  }
-
-  // 時間表示のフォーマットを行うヘルパーメソッド
-  String _formatDuration(Duration duration) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    String hours = duration.inHours > 0 ? '${twoDigits(duration.inHours)}:' : '';
-    String minutes = twoDigits(duration.inMinutes.remainder(60));
-    String seconds = twoDigits(duration.inSeconds.remainder(60));
-    return '$hours$minutes:$seconds';
-  }
-
-  // プレイリスト表示を更新
   Widget _buildPlaylist() {
     return ListView.builder(
       itemCount: _playlist.length,
@@ -530,86 +354,130 @@ class _MyHomePageState extends State<MyHomePage> {
         return ListTile(
           leading: Checkbox(
             value: music.isSelected,
-            onChanged: (bool? value) {
-              setState(() {
-                music.isSelected = value ?? true;
-                if (index == _currentIndex && !music.isSelected && _isPlaying) {
-                  _playNextSong();
-                }
-                _saveSelectionState();  // 状態を保存
-              });
-            },
+            onChanged: (value) => _toggleSelection(index, value ?? true),
           ),
           title: Text(music.name),
-          trailing: Text(_formatDuration(music.duration)),
+          subtitle: Text(_formatDuration(music.duration)),
           selected: index == _currentIndex,
-          onTap: () {
-            if (music.isSelected) {
-              setState(() {
-                _currentIndex = index;
-                _currentFilePath = music.path;
-              });
-              _playMusic();
-            }
-          },
+          onTap: () => _selectTrack(index),
         );
       },
     );
   }
 
-  @override
-  void dispose() {
-    _audioPlayer.dispose();
-    super.dispose();
+  void _toggleSelection(int index, bool value) {
+    setState(() => _playlist[index].isSelected = value);
+    _saveSelectionState();
+    if (index == _currentIndex && !value && _isPlaying) {
+      _playNextSong();
+    }
   }
 
-  Future<void> _loadMusicFromFolder(String path) async {
+  Future<void> _selectTrack(int index) async {
+    if (!_playlist[index].isSelected) return;
+    
+    setState(() => _currentIndex = index);
+    _currentFilePath = _playlist[index].path;
+    await _playMusic();
+  }
+
+  String _formatDuration(Duration d) => 
+    '${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}';
+
+  Future<void> _pickMusicFolder() async {
     try {
-      Directory directory = Directory(path);
-      List<FileSystemEntity> files = directory.listSync(recursive: true);
-      
-      _playlist.clear();
-      
-      for (var file in files) {
-        if (file is File) {
-          String filePath = file.path.toLowerCase();
-          if (filePath.endsWith('.mp3') || 
-              filePath.endsWith('.m4a') || 
-              filePath.endsWith('.wav') || 
-              filePath.endsWith('.aac')) {
-            
-            final player = AudioPlayer();
-            Duration? songDuration;
-            try {
-              await player.setSource(DeviceFileSource(file.path));
-              songDuration = await player.getDuration();
-            } finally {
-              await player.dispose();
-            }
-
-            String name = file.path.split(Platform.pathSeparator).last;
-            _playlist.add(MusicFile(
-              path: file.path,
-              name: name,
-              duration: songDuration ?? Duration.zero,
-            ));
-          }
-        }
-      }
-
-      setState(() {
-        if (_playlist.isNotEmpty) {
-          _currentIndex = 0;
-          _currentFilePath = _playlist[0].path;
-        }
-      });
-
-      if (_playlist.isNotEmpty) {
-        await _playMusic();
-      }
+      final path = await FilePicker.platform.getDirectoryPath();
+      if (path != null) await _loadMusicFromFolder(path);
     } catch (e) {
-      print('Error loading music from folder: $e');
+      print('フォルダ選択エラー: $e');
     }
+  }
+
+  void _showSortMenu() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('並び替え'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _buildSortButton('名前順', () => _sortPlaylist((a, b) => a.name.compareTo(b.name))),
+            _buildSortButton('再生時間', () => _sortPlaylist((a, b) => a.duration.compareTo(b.duration))),
+          ],
+        ),
+      ),
+    );
+  }
+
+  ListTile _buildSortButton(String label, VoidCallback onPressed) {
+    return ListTile(
+      title: Text(label),
+      onTap: () {
+        onPressed();
+        Navigator.pop(context);
+      },
+    );
+  }
+
+  void _sortPlaylist(Comparator<MusicFile> comparator) {
+    setState(() {
+      _playlist.sort(comparator);
+      _currentIndex = _playlist.indexWhere((m) => m.path == _currentFilePath);
+    });
+  }
+
+  Future<void> _saveSelectionState() async {
+    final selections = {for (var m in _playlist) m.path: m.isSelected};
+    await _prefs.setString('selections', jsonEncode(selections));
+  }
+
+  Future<void> _loadSelectionState() async {
+    final json = _prefs.getString('selections');
+    if (json == null) return;
+
+    final selections = Map<String, dynamic>.from(jsonDecode(json));
+    for (var music in _playlist) {
+      music.isSelected = selections[music.path] ?? true;
+    }
+    setState(() {});
+  }
+
+  Future<void> _setupBackgroundPlayback() async {
+    // AudioPlayersの設定
+    await _audioPlayer.setReleaseMode(ReleaseMode.stop);
+    
+    if (Platform.isAndroid) {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration(
+        androidAudioAttributes: AndroidAudioAttributes(
+          contentType: AndroidAudioContentType.music,
+          usage: AndroidAudioUsage.media,
+        ),
+        androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
+        androidWillPauseWhenDucked: true,
+      ));
+      
+      await session.setActive(true);
+    }
+    
+    // イベントリスナーの設定
+    _audioPlayer.onPlayerStateChanged.listen((state) {
+      if (state == PlayerState.completed) {
+        _playNextSong();
+      }
+    });
   }
 }
 
+class Lock {
+  bool _isLocked = false;
+  Future<void> synchronized(Future<void> Function() task) async {
+    while (_isLocked) await Future.delayed(const Duration(milliseconds: 10));
+    _isLocked = true;
+    try {
+      await task();
+    } finally {
+      _isLocked = false;
+    }
+  }
+}
