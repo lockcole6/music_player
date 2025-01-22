@@ -127,7 +127,10 @@ class _MyHomePageState extends State<MyHomePage> {
     
     await _playerStateLock.synchronized(() async {
       if (state == PlayerState.stopped && !_isLoading) {
-        await _playNextSong();
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (_audioPlayer.state == PlayerState.stopped) {
+          await _playNextSong();
+        }
       }
       setState(() => _isPlaying = state == PlayerState.playing);
     });
@@ -143,7 +146,12 @@ class _MyHomePageState extends State<MyHomePage> {
 
   void _handlePlaybackComplete(void _) {
     if (!mounted) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) => _playNextSong());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await Future.delayed(const Duration(milliseconds: 300));
+      if (_audioPlayer.state == PlayerState.completed) {
+        await _playNextSong();
+      }
+    });
   }
 
   Future<void> _playMusic() async {
@@ -157,13 +165,12 @@ class _MyHomePageState extends State<MyHomePage> {
         return;
       }
 
+      // 再生リセット処理を明確化
       await _audioPlayer.stop();
       await _audioPlayer.setSource(DeviceFileSource(currentSong.path));
       await _audioPlayer.resume();
 
-      setState(() {
-        _currentFilePath = currentSong.path;
-      });
+      setState(() => _currentFilePath = currentSong.path);
       await _prefs.setInt('lastIndex', _currentIndex);
     } catch (e) {
       print('再生エラー: $e');
@@ -176,25 +183,27 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> _playNextSong() async {
     if (_playlist.isEmpty) return;
 
-    int originalIndex = _currentIndex;
+    int startIndex = _currentIndex;
     int nextIndex = _currentIndex;
-    int checkedCount = 0;
+    int loopCount = 0;
 
-    while (checkedCount < _playlist.length) {
+    do {
       nextIndex = (nextIndex + 1) % _playlist.length;
-      checkedCount++;
+      loopCount++;
+
+      if (loopCount > _playlist.length) {
+        await _audioPlayer.stop();
+        setState(() => _isPlaying = false);
+        return;
+      }
 
       if (_playlist[nextIndex].isSelected) {
-        _currentIndex = nextIndex;
+        setState(() => _currentIndex = nextIndex);
         await _playMusic();
         return;
       }
-    }
 
-    if (originalIndex == _currentIndex) {
-      await _audioPlayer.stop();
-      setState(() => _isPlaying = false);
-    }
+    } while (nextIndex != startIndex);
   }
 
   Future<void> _playPreviousSong() async {
